@@ -108,7 +108,7 @@ pub trait CheckBase32<T: AsRef<[u5]>> {
 #[derive(PartialEq, Eq, Debug, Clone, PartialOrd, Ord, Hash)]
 pub struct Bech32 {
     /// Human-readable part
-    hrp: String,
+    hrp: Vec<u8>,
     /// Data payload
     data: Vec<u5>
 }
@@ -172,7 +172,7 @@ impl<T: AsRef<[u8]>> ToBase32<Vec<u5>> for T {
 
 impl Bech32 {
     /// Constructs a `Bech32` struct if the result can be encoded as a bech32 string.
-    pub fn new(hrp: String, data: Vec<u5>) -> Result<Bech32, Error> {
+    pub fn new(hrp: Vec<u8>, data: Vec<u5>) -> Result<Bech32, Error> {
         if hrp.is_empty() {
             return Err(Error::InvalidLength)
         }
@@ -185,12 +185,12 @@ impl Bech32 {
     ///
     /// This function currently allocates memory for the checked data part.
     /// See [issue #19](https://github.com/rust-bitcoin/rust-bech32/issues/19).
-    pub fn new_check_data(hrp: String, data: Vec<u8>) -> Result<Bech32, Error> {
+    pub fn new_check_data(hrp: Vec<u8>, data: Vec<u8>) -> Result<Bech32, Error> {
         Self::new(hrp, data.check_base32()?)
     }
 
     /// Returns the human readable part
-    pub fn hrp(&self) -> &str {
+    pub fn hrp(&self) -> &[u8] {
         &self.hrp
     }
 
@@ -200,27 +200,30 @@ impl Bech32 {
     }
 
     /// Destructures the `Bech32` struct into its parts
-    pub fn into_parts(self) -> (String, Vec<u5>) {
+    pub fn into_parts(self) -> (Vec<u8>, Vec<u5>) {
         (self.hrp, self.data)
     }
 
     /// Parses a Bech32 string but without enforcing the 90 character limit (for lightning BOLT 11).
-    pub fn from_str_lenient(s: &str) -> Result<Bech32, Error> {
+    pub fn from_str_lenient(s: Vec<u8>) -> Result<Bech32, Error> {
         // Ensure overall length is within bounds
         let len: usize = s.len();
         if len < 8 {
             return Err(Error::InvalidLength)
         }
 
+        let index = s.binary_search(&(SEP as u8));
         // Check for missing separator
-        if s.find(SEP).is_none() {
+        if index.is_ok() == false {
             return Err(Error::MissingSeparator)
         }
 
         // Split at separator and check for two pieces
-        let parts: Vec<&str> = s.rsplitn(2, SEP).collect();
-        let raw_hrp = parts[1];
-        let raw_data = parts[0];
+        let (raw_hrp, raw_data) = s.split_at(index.unwrap());
+        let raw_data = if let Some((_, raw_data)) = raw_data.split_first() {
+            raw_data
+        } else { return Err(Error::InvalidLength); };
+
         if raw_hrp.len() < 1 || raw_data.len() < 6 {
             return Err(Error::InvalidLength)
         }
@@ -228,10 +231,10 @@ impl Bech32 {
         let mut has_lower: bool = false;
         let mut has_upper: bool = false;
         let mut hrp_bytes: Vec<u8> = Vec::new();
-        for b in raw_hrp.bytes() {
+        for &b in raw_hrp {
             // Valid subset of ASCII
             if b < 33 || b > 126 {
-                return Err(Error::InvalidChar(b as char))
+                return Err(Error::InvalidChar(b as char));
             }
             let mut c = b;
             // Lowercase
@@ -248,9 +251,10 @@ impl Bech32 {
         }
 
         // Check data payload
-        let mut data_bytes = raw_data.chars().map(|c| {
+        let mut data_bytes: Vec<u5> = raw_data.iter().map(|&c| {
             // Only check if c is in the ASCII range, all invalid ASCII characters have the value -1
             // in CHARSET_REV (which covers the whole ASCII range) and will be filtered out later.
+            let c = c as char;
             if !c.is_ascii() {
                 return Err(Error::InvalidChar(c))
             }
@@ -286,7 +290,7 @@ impl Bech32 {
         data_bytes.truncate(dbl - 6);
 
         Ok(Bech32 {
-            hrp: String::from_utf8(hrp_bytes).unwrap(),
+            hrp: hrp_bytes,
             data: data_bytes
         })
     }
@@ -294,14 +298,14 @@ impl Bech32 {
 
 impl Display for Bech32 {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        let hrp_bytes: &[u8] = self.hrp.as_bytes();
+        let hrp_bytes: &[u8] = self.hrp.as_slice();
         let checksum = create_checksum(hrp_bytes, &self.data);
         let data_part = self.data.iter().chain(checksum.iter());
 
         write!(
             f,
             "{}{}{}",
-            self.hrp,
+            self.hrp.iter().map(|p| CHARSET[*p as usize]).collect::<String>(),
             SEP,
             data_part.map(|p| CHARSET[*p.as_ref() as usize]).collect::<String>()
         )
@@ -316,7 +320,7 @@ impl FromStr for Bech32 {
         if s.len() > 90 {
             return Err(Error::InvalidLength)
         }
-        Self::from_str_lenient(s)
+        Self::from_str_lenient(s.as_bytes().to_vec())
     }
 }
 
@@ -513,12 +517,12 @@ mod tests {
     fn getters() {
         let bech: Bech32 = "BC1SW50QA3JX3S".parse().unwrap();
         let data = [16, 14, 20, 15, 0].check_base32().unwrap();
-        assert_eq!(bech.hrp(), "bc");
+        assert_eq!(bech.hrp(), b"bc".to_vec().as_slice());
         assert_eq!(
             bech.data(),
             data.as_slice()
         );
-        assert_eq!(bech.into_parts(), ("bc".to_owned(), data));
+        assert_eq!(bech.into_parts(), (b"bc".to_vec(), data));
     }
 
     #[test]
@@ -532,6 +536,7 @@ mod tests {
         );
         for s in strings {
             let decode_result = s.parse::<Bech32>();
+            println!("-----s:{:?}, decode_result:{:?}", s, decode_result);
             if !decode_result.is_ok() {
                 panic!("Did not decode: {:?} Reason: {:?}", s, decode_result.unwrap_err());
             }
@@ -629,8 +634,8 @@ mod tests {
     #[test]
     fn lenient_parsing() {
         assert_ne!(
-            Bech32::from_str_lenient("an84characterslonghumanreadablepartthatcontainsthenumber1a\
-            ndtheexcludedcharactersbio1569pvx"),
+            Bech32::from_str_lenient(b"an84characterslonghumanreadablepartthatcontainsthenumber1a\
+            ndtheexcludedcharactersbio1569pvx".to_vec()),
             Err(Error::InvalidLength)
         );
     }
